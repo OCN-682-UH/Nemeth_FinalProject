@@ -1,0 +1,184 @@
+---
+title: "On the front lines of marine megafauna tourism: how wildlife interactions, encounter quality and crew dynamics determine employee earnings"
+author: "Cameron Nemeth"
+format:
+  html:
+    code-fold: true              # code hidden by default, with a toggle button
+    code-summary: "Show code"    # customize the button label
+    embed-resources: true # avoids the extra folders by placing images, scripts etc into the HTML itself 
+editor: visual
+warning: false
+theme: minty
+---
+
+Load libraries
+
+```{r}
+library(readr)
+library(dplyr)
+library(grid)
+library(ggplot2)
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(openxlsx)
+library(estimatr)   # for lm_robust()
+library(car)
+library(rstatix)
+library(PMCMRplus)
+library(ggpmisc) # found this package to add equation and r2 to plots
+library(here)
+```
+
+**Load data**
+
+```{r}
+RawData <- read_csv(here("Data", "Raw", "TourTips_Redacted.csv"), na = "") # only empty cells are missing. I write "NA" on the raw data sheet when something is truly not applicable. 
+```
+
+**Fix the NAs**
+
+```{r}
+# Fix "NA" strings in all character columns EXCEPT OtherSpecies
+Data <- RawData  |> 
+  mutate(
+    across(
+      .cols = where(is.character) & !OtherSpecies,   # text columns, except OtherSpecies, which I will use to create a seal column
+      .fns  = \(x) na_if(x, "NA")             # change my text NA to real na
+  ))
+```
+
+**Create new columns that I will need in later analyses**
+
+I originally thought seals would be a fairly rare encounter, so they did not get their own column and instead were included as a free response under "OtherSpecies". However, we had a monk seal that decided to stay in the harbor for \~6 weeks, making sightings much more common than expected, at least for a period of time.
+
+As a result, we will add a seal column here.
+
+```{r}
+# Create new columns that are necessary downstream
+Data <- Data |>
+  # Create a seal column 
+  mutate(Seals = ifelse(OtherSpecies == "Seal", 1, 0))
+```
+
+Create columns for when only a certain species is present. This will be useful when we want to do analyses where only certain species were observed on a trip. 0 = false (that species was not seen). 1 = true (that species was seen).
+
+```{r}
+
+  
+# Create Only-species columns
+Data <- Data |> 
+  mutate(
+    OnlyDolphins = ifelse(
+      Dolphins == 1 & Whales == 0 & Seals == 0 & Other == 0, 1, 0
+    ),
+    OnlyWhales = ifelse(
+      Whales == 1 & Dolphins == 0 & Seals == 0 & Other == 0, 1, 0
+    ),
+    # Note: I originally thought seals would be a very rare sighting, thus they did not get their own column and instead are derived from OtherSpecies == "Seal".
+    
+    # As a result, Seals == 1 implies Other == 1. That's why OnlySeals (unlike OnlyDolphins/ OnlyWhales/OnlyTurtles) does not check Other == 0 because doing so would exclude every seal trip. Fortunately, seals were never seen with a weird species, otherwise a different solution would be needed. 
+    OnlySeals = ifelse(
+      Seals == 1 & Dolphins == 0 & Whales == 0, 1, 0
+    ),
+    OnlyTurtles = ifelse(
+      Turtles == 1 & Dolphins == 0 & Whales == 0 & Seals == 0 & Other == 0, 1, 0
+    )
+  )
+```
+
+Now add column for if nothing was seen at all.
+
+```{r}
+# Nothing seen at all: no mammals AND no turtles
+Data <- Data |> 
+  mutate(
+  Nothing = ifelse(
+    Dolphins == 0 &
+    Whales   == 0 &
+    Seals    == 0 &
+    Turtles  == 0 &
+    Other == 0,
+  1, 0
+))
+```
+
+Add columns for marine mammal presence
+
+```{r}
+# Add a column to indicate marine mammal presence
+Data <- Data |>
+  mutate(
+    MMPresence        = ifelse(Whales == 1 | Dolphins == 1 | Seals == 1, 1, 0),
+    MultipleMMPresence = ifelse((Whales + Dolphins + Seals) >= 2, 1, 0),
+    OneMMPresence      = ifelse((Whales + Dolphins + Seals) == 1, 1, 0)
+  )
+```
+
+Organize these new columns so they sit at a more logical spot in the datasheet
+
+```{r}
+# Move these new columns to the right of "OtherSpecies"
+Data <- Data |>
+  relocate(Seals, OnlyDolphins, OnlyWhales, OnlySeals, OnlyTurtles, Nothing,
+           MMPresence, OneMMPresence, MultipleMMPresence,
+           .after = OtherSpecies)
+```
+
+Later in the study period, I started to collect data on the behavior of animals during an encounter. I want to add new columns for the number of unique behaviors observed.
+
+```{r}
+# Add columns for the number of unique behaviors exhibited (jumping and/or bowriding)
+Data <- Data |>
+  mutate(
+    
+    # No activities
+    NoActivities = ifelse(Jump == 0 & Bowride == 0, 1, 0),
+    
+    # 1 activity
+    OneActivity = ifelse(
+      (Jump == 1 & Bowride == 0) |
+        (Jump == 0 & Bowride == 1),
+      1, 0
+    ),
+    
+    # 2 activities
+    TwoActivities = ifelse(Jump == 1 & Bowride == 1, 1, 0)
+  )
+```
+
+**Create new dataframes to isolate the data we are interested in**
+
+Data was collected from two different locations, however, there was not a sufficient amount of data from 1 of the 2, so I will only include data from the "Town" location. This location is situated on the south shore of Oahu, the other is on the western shore.
+
+Data was also collected from regular trips during the daytime and from sunset trips. For consistency, I only wish to include data regular trips.
+
+```{r}
+# Create a new dataframe for Town data and regular trips
+Town_Regular <- Data |> 
+  filter(Location == "Town", Sunset == 0) 
+```
+
+**Visualizing the data**
+
+- **Tips per guest as a function of the number of guests onboard**
+
+First, I think it makes sense to create an exploratory plot showing the effect of the number of passengers onboard a trip and the tips earned per passenger. You could hypothesize that as the boat nears capacity, the satisfaction of some guests may decline, leading to less tips earned. If significant, we may need to consider this effect in further analyses.
+
+```{r}
+Plot_TPG_NumGuests <- ggplot(
+  Town_Regular,
+  aes(x = NumGuests, y = TipsPerGuest)
+) +
+  geom_point(size = 2.8, alpha = 0.85, color = "black") +
+  stat_poly_line(color = "black") + # Uses ggpmisc for line and shaded SE
+  stat_poly_eq(use_label(c("eq", "R2")), # Add equation and r squared
+               label.x = "right", label.y = "top") +
+  labs(
+    x = "Number of guests",
+    y = "Tips per guest (USD)"
+  ) +
+  theme_bw(base_size = 14)
+
+Plot_TPG_NumGuests
+```
